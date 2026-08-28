@@ -672,6 +672,7 @@ fn main() {
     // `[r0+4]` put it eight bytes up the stack and the title never saw a single input.
     m.set_stub("InputEvents", 0, Stub::InputPoll { arg: 1, offset: 0 });
     m.set_stub("Filesytem", 0, Stub::FileOpen { path: 1, out: 3, return_handle: open_ret_handle });
+    m.set_stub("Filesytem", 1, Stub::FileClose { handle: 0 });
     m.set_stub("AsyncFileIO", 0, Stub::FileOpen { path: 1, out: 3, return_handle: open_ret_handle });
     m.set_stub("AsyncFileIO", 3, Stub::FileOpen { path: 1, out: 2, return_handle: open_ret_handle });
     let rd = Stub::FileRead { handle: 0, buffer: 1, length: 2, out: 3 };

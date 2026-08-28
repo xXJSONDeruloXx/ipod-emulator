@@ -2824,6 +2824,10 @@ pub enum Stub {
     ///   `miscTBD #1` on `0x19001768`) and abandons the load — leaving the title screen up
     ///   forever with no error anywhere.
     FileOpen { path: usize, out: usize, return_handle: bool },
+    /// `Filesytem #1(handle)` — close a legacy file handle. The direct-EAPP runner keeps the
+    /// numeric slot allocated so later handles remain stable, but rejects reads, seeks, and
+    /// writes through the closed slot.
+    FileClose { handle: usize },
     /// `AsyncFileIO #0` / `#3` — open, the way RetailOS actually implements it.
     ///
     /// Measured against Apple's own code in `osos`, reached through the shim at `0x002680e4`:
@@ -3048,6 +3052,9 @@ pub struct Machine {
     pub game_dir: Option<std::path::PathBuf>,
     /// Contents and read position of each opened file, indexed by handle - 1.
     open_files: Vec<(Vec<u8>, usize)>,
+    /// Whether each handle has been closed. Slots are retained to keep guest handle numbers
+    /// stable, matching the monotonic handle allocation used by the other file stubs.
+    closed_files: Vec<bool>,
     /// The file behind each open handle, parallel to `open_files`.
     open_paths: Vec<String>,
     /// Rewind a file after a load-on-open, so a later read starts from the beginning.
@@ -3502,6 +3509,7 @@ impl Machine {
             watch_log: Capped::new(4096),
             game_dir: None,
             open_files: Vec::new(),
+            closed_files: Vec::new(),
             open_paths: Vec::new(),
             rewind_after_load: true,
             allow_creates: false,
@@ -4198,6 +4206,7 @@ impl Machine {
         let Some(path) = found else { return 0 };
         let Ok(data) = std::fs::read(&path) else { return 0 };
         self.open_files.push((data, 0));
+        self.closed_files.push(false);
         self.open_writable.push(false); // opened to READ — a write here is refused
         // The FULL path, not the base name: sound effects live in `c00bank/`, and the player
         // resolves what it is handed. A bare "0.wav" would not be found from the game directory.
@@ -4250,6 +4259,7 @@ impl Machine {
             return 0;
         }
         self.open_files.push((data, 0));
+        self.closed_files.push(false);
         self.open_writable.push(true);
         self.open_paths.push(path.to_string_lossy().into_owned());
         self.writable.push(true);
@@ -4306,9 +4316,24 @@ impl Machine {
         self.open_files.len()
     }
 
+    fn handle_is_open(&self, handle: usize) -> bool {
+        handle != 0
+            && handle <= self.open_files.len()
+            && !self.closed_files.get(handle - 1).copied().unwrap_or(true)
+    }
+
+    fn close_file(&mut self, handle: usize) {
+        if self.handle_is_open(handle) {
+            self.closed_files[handle - 1] = true;
+            self.file_log.push(format!("close handle {handle} -> ok"));
+        } else {
+            self.file_log.push(format!("close handle {handle} -> unknown"));
+        }
+    }
+
     /// Advance an open file's position without transferring anything, returning how far it moved.
     fn seek_file(&mut self, handle: usize, by: u32) -> u32 {
-        if handle == 0 || handle > self.open_files.len() {
+        if !self.handle_is_open(handle) {
             return 0;
         }
         let (data, pos) = &self.open_files[handle - 1];
@@ -4320,7 +4345,7 @@ impl Machine {
     /// Write `len` bytes from guest memory into the open file, advancing its position, and
     /// persist it. This is `AsyncFileIO` op 3 — see `0x001e3d90`.
     fn write_file(&mut self, handle: usize, buf: u32, len: u32) -> u32 {
-        if handle == 0 || handle > self.open_files.len() || buf == 0 || len == 0 || len >= 1 << 24 {
+        if !self.handle_is_open(handle) || buf == 0 || len == 0 || len >= 1 << 24 {
             return 0;
         }
         // A write may only ever touch a file that was OPENED FOR WRITING.
@@ -4356,7 +4381,7 @@ impl Machine {
     /// 64-bit offset (`mov r1, r2, asr #31`) and calls the stream's seek at `0x002258a4`. Whence
     /// follows the C convention it is checked against — 0 set, 1 current, 2 end.
     fn seek_to(&mut self, handle: usize, offset: i32, whence: u32) -> u32 {
-        if handle == 0 || handle > self.open_files.len() {
+        if !self.handle_is_open(handle) {
             return 0;
         }
         let (data, pos) = &self.open_files[handle - 1];
@@ -4372,7 +4397,7 @@ impl Machine {
 
     /// Copy up to `len` bytes from the open file into guest memory, advancing its position.
     fn read_file(&mut self, handle: usize, buf: u32, len: u32) -> u32 {
-        if handle == 0 || handle > self.open_files.len() {
+        if !self.handle_is_open(handle) {
             return 0;
         }
         let (data, pos) = &self.open_files[handle - 1];
@@ -6253,6 +6278,11 @@ impl Machine {
                         } else {
                             0
                         }
+                    }
+                    Some(Stub::FileClose { handle }) => {
+                        let h = self.cpu.regs[*handle] as usize;
+                        self.close_file(h);
+                        0
                     }
                     Some(Stub::AsyncOpen { path, request }) => {
                         let (pa, req) = (self.cpu.regs[*path], self.cpu.regs[*request]);
@@ -11764,6 +11794,24 @@ mod peek_tests {
         }
         assert!(!is_supported_sound_path("c00bank/effect.bin"));
         assert!(!is_supported_sound_path("c00bank/effect"));
+    }
+
+    #[test]
+    fn closing_a_legacy_file_rejects_future_reads() {
+        let dir = std::env::temp_dir().join(format!("eapp-close-test-{}", std::process::id()));
+        let _ = std::fs::create_dir_all(&dir);
+        let asset = dir.join("asset.bin");
+        std::fs::write(&asset, b"DATA").unwrap();
+
+        let mut m = Machine::new(&EApp::none(), 0x1100_0000, 0x0100_0000);
+        m.game_dir = Some(dir.clone());
+        let h = m.open_file("asset.bin") as usize;
+        let buf = m.scratch(4);
+        assert_eq!(m.read_file(h, buf, 4), 4);
+        m.close_file(h);
+        assert_eq!(m.read_file(h, buf, 4), 0);
+        assert_eq!(m.seek_file(h, 1), 0);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     /// A write must never be able to touch a file that was opened to READ.
