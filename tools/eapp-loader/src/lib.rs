@@ -2350,6 +2350,33 @@ const SYS_EXIT: u32 = 0x18;
 pub const FB_WIDTH: usize = 320;
 pub const FB_HEIGHT: usize = 240;
 
+/// The small set of direct-EAPP titles whose vertex arrays use normalized coordinates rather
+/// than the pixel-space convention used by the rest of the runner. FLIWHEEL measured this view as
+/// 1.2 by 0.9 NDC units on the 320x240 panel.
+const NDC_VIEW_MAX_X: f32 = 1.2;
+const NDC_VIEW_MAX_Y: f32 = 0.9;
+
+fn is_ndc_position((x, y): (f32, f32)) -> bool {
+    (0.0..2.0).contains(&x) && (0.0..2.0).contains(&y)
+}
+
+fn ndc_to_pixel_position((x, y): (f32, f32)) -> (f32, f32) {
+    (x / NDC_VIEW_MAX_X * FB_WIDTH as f32, y / NDC_VIEW_MAX_Y * FB_HEIGHT as f32)
+}
+
+/// Audio assets are not limited to WAV. In particular, AAC-backed game bundles are common on
+/// the iPod, and the host player already accepts these formats; the extension filter is only used
+/// to associate an opened file with a later sound-effect handle.
+fn is_supported_sound_path(path: &str) -> bool {
+    let Some(ext) = std::path::Path::new(path).extension().and_then(|ext| ext.to_str()) else {
+        return false;
+    };
+    matches!(
+        ext.to_ascii_lowercase().as_str(),
+        "wav" | "mp3" | "flac" | "ogg" | "aac" | "mp4" | "m4a" | "m4b" | "m4p" | "m4r"
+    )
+}
+
 /// The PP5022's on-chip SRAM, which eApps use for small hot state.
 pub const IRAM_BASE: u32 = 0x4000_0000;
 pub const IRAM_SIZE: usize = 0x0002_0000; // 128 KB
@@ -3052,6 +3079,10 @@ pub struct Machine {
     /// location 0. `None` until a game uploads one, in which case vertices are already in screen
     /// coordinates and are used as they are.
     pub mvp: Option<[f32; 16]>,
+    /// The title uses the normalized direct-EAPP view measured by FLIWHEEL. This is configured
+    /// from the executable name in `play`, and is deliberately not a global default because the
+    /// other titles submit pixel coordinates.
+    pub normalized_coordinates: bool,
     /// The per-draw modulate colour from `glUniform4xvAPPLE`, RGBA in 0..1.
     pub modulate: [f32; 4],
     /// The last texture name handed out by `glGenTextures`. Starts at 0 so the first name is 1.
@@ -3480,6 +3511,7 @@ impl Machine {
             battery: None,
             battery_override: None,
             mvp: None,
+            normalized_coordinates: false,
             modulate: [1.0; 4],
             next_texture_name: 0,
             proj_flips_y: false,
@@ -4174,7 +4206,7 @@ impl Machine {
         // effects only by opening them — Pac-Man creates all sixteen descriptors up front and
         // never calls the buffer setter — is matched by position: the Nth descriptor is the Nth
         // sound opened. Deduplicated, because a game may re-open one while streaming it.
-        if full.to_ascii_lowercase().ends_with(".wav") && !self.sfx_files.contains(&full) {
+        if is_supported_sound_path(&full) && !self.sfx_files.contains(&full) {
             self.sfx_files.push(full.clone());
         }
         self.open_paths.push(full);
@@ -4811,6 +4843,14 @@ impl Machine {
                     1.0
                 };
                 let (vx, vy) = self.project(ax, ay, az, aw);
+                let (vx, vy) = if self.normalized_coordinates
+                    && !self.transforming()
+                    && is_ndc_position((vx, vy))
+                {
+                    ndc_to_pixel_position((vx, vy))
+                } else {
+                    (vx, vy)
+                };
                 Vertex {
                     x: vx,
                     y: vy,
@@ -5166,7 +5206,9 @@ impl Machine {
                 // already working in top-left coordinates and flipping again turns the picture
                 // over. Bejeweled does exactly that and rendered its whole menu upside down;
                 // Minigolf never sets a matrix at all, so it keeps the default flip.
-                let row = if self.proj_flips_y && !self.transforming() {
+                let row = if (self.normalized_coordinates && !self.transforming())
+                    || self.proj_flips_y
+                {
                     py
                 } else {
                     FB_HEIGHT - 1 - py
@@ -11703,6 +11745,25 @@ mod peek_tests {
         let (_, _, rgba) = decode_bmp(&d).expect("a well-formed 8-bit bitmap");
         assert_eq!(&rgba[0..4], &[255, 255, 255, 255], "index 255 is full coverage");
         assert_eq!(&rgba[4..8], &[255, 255, 255, 0], "index 0 is transparent, not black");
+    }
+
+    #[test]
+    fn normalized_eapp_coordinates_map_to_the_measured_viewport() {
+        let (x, y) = ndc_to_pixel_position((NDC_VIEW_MAX_X, NDC_VIEW_MAX_Y));
+        assert!((x - FB_WIDTH as f32).abs() < f32::EPSILON);
+        assert!((y - FB_HEIGHT as f32).abs() < f32::EPSILON);
+        assert!(is_ndc_position((0.0, 0.0)));
+        assert!(is_ndc_position((1.99, 1.99)));
+        assert!(!is_ndc_position((2.0, 1.0)));
+    }
+
+    #[test]
+    fn game_audio_discovery_accepts_the_fliwheel_sound_extensions() {
+        for ext in ["wav", "MP3", "flac", "ogg", "aac", "mp4", "m4a", "m4b", "m4p", "m4r"] {
+            assert!(is_supported_sound_path(&format!("c00bank/effect.{ext}")), "{ext}");
+        }
+        assert!(!is_supported_sound_path("c00bank/effect.bin"));
+        assert!(!is_supported_sound_path("c00bank/effect"));
     }
 
     /// A write must never be able to touch a file that was opened to READ.

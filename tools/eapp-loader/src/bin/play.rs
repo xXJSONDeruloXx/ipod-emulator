@@ -222,6 +222,17 @@ fn defaults_for(exe: &str) -> TitleDefaults {
     }
 }
 
+/// FLIWHEEL measured these four direct-EAPP title families using a 1.2 by 0.9 normalized view.
+/// Keep the switch title-scoped: the other games in the corpus submit pixel coordinates, and
+/// applying this map to them would collapse ordinary screen positions into the upper-left corner.
+fn uses_normalized_coordinates(exe: &str) -> bool {
+    let exe = exe.to_ascii_lowercase();
+    exe.starts_with("simsbowling")
+        || exe.starts_with("simspool")
+        || exe.starts_with("sudoku")
+        || exe.starts_with("solitaire")
+}
+
 fn post_event(m: &mut Machine, ctx_base: u32, node: u32, ty: u8, state: u8, payload: u32, wheel: u8) {
     // The real mechanism, from Apple's `postEvent` at `0x0024d918`: a 12-byte node —
     // `{ type at +0x00, state at +0x01, payload at +0x04, next at +0x08 }` — appended to a list
@@ -674,6 +685,10 @@ fn main() {
         .map(|n| n.to_string_lossy().into_owned())
         .unwrap_or_default();
     let td = defaults_for(&title_exe);
+    m.normalized_coordinates = uses_normalized_coordinates(&title_exe);
+    if m.normalized_coordinates {
+        println!("geometry: normalized EAPP coordinates (1.2 x 0.9 view)");
+    }
 
     // --async-files : model AsyncFileIO as RetailOS implements it — accept the operation, park
     // the request, and run the game's completion callback between frames. Request-object
