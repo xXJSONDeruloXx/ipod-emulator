@@ -1,6 +1,6 @@
 //! Run an iPod game in a window.
 //!
-//!   play <game.bin> [--gamedir=DIR] [--scale=N] [--fps=N]
+//!   play <game.bin> [--gamedir=DIR] [--scale=N] [--fps=N] [--headless --frames=N]
 //!
 //! Everything the offline `trace` tool established is wired up here: context arguments to the
 //! frame vectors, the manifest texture pre-load, the allocator, the clock, and file I/O. The
@@ -343,6 +343,70 @@ fn lock_aspect_ratio(window: &Window) {
 #[cfg(not(target_os = "macos"))]
 fn lock_aspect_ratio(_window: &Window) {}
 
+/// The interactive viewer and the deterministic batch runner share one frame loop. Keeping the
+/// input and presentation calls behind this small adapter lets `--headless --frames=N` exercise
+/// the exact same EAPP path without creating a GUI window or consuming host input.
+enum RunnerWindow {
+    Interactive(Window),
+    Headless,
+}
+
+impl RunnerWindow {
+    fn is_open(&self) -> bool {
+        match self {
+            Self::Interactive(window) => window.is_open(),
+            Self::Headless => true,
+        }
+    }
+
+    fn is_key_down(&self, key: Key) -> bool {
+        match self {
+            Self::Interactive(window) => window.is_key_down(key),
+            Self::Headless => false,
+        }
+    }
+
+    fn is_key_pressed(&self, key: Key, repeat: minifb::KeyRepeat) -> bool {
+        match self {
+            Self::Interactive(window) => window.is_key_pressed(key, repeat),
+            Self::Headless => false,
+        }
+    }
+
+    fn get_mouse_down(&self, button: MouseButton) -> bool {
+        match self {
+            Self::Interactive(window) => window.get_mouse_down(button),
+            Self::Headless => false,
+        }
+    }
+
+    fn get_scroll_wheel(&self) -> Option<(f32, f32)> {
+        match self {
+            Self::Interactive(window) => window.get_scroll_wheel(),
+            Self::Headless => None,
+        }
+    }
+
+    fn set_target_fps(&mut self, fps: usize) {
+        if let Self::Interactive(window) = self {
+            window.set_target_fps(fps);
+        }
+    }
+
+    fn update_with_buffer(&mut self, buffer: &[u32], width: usize, height: usize) -> minifb::Result<()> {
+        match self {
+            Self::Interactive(window) => window.update_with_buffer(buffer, width, height),
+            Self::Headless => Ok(()),
+        }
+    }
+
+    fn set_title(&mut self, title: &str) {
+        if let Self::Interactive(window) = self {
+            window.set_title(title);
+        }
+    }
+}
+
 
 /// Every `afplay` this process has started, so it can be stopped however the emulator dies.
 ///
@@ -474,22 +538,21 @@ const RAM_SIZE: usize = 0x0080_0000;
 fn main() {
     reaper::install();
     let args: Vec<String> = env::args().skip(1).collect();
+    let headless = args.iter().any(|a| a == "--headless");
     // Reject unknown flags instead of ignoring them.
     //
-    // `--headless` was accepted silently for this whole project and did NOTHING — there is no
-    // headless mode, `play` always opens a window. Every "headless" sweep therefore ran twenty
-    // games with their audio live, which is how a stuck stream ended up buzzing through the
-    // user's speakers long after the run. A flag that does nothing is worse than a flag that
-    // errors: it makes every result taken with it suspect.
+    // Batch callers need a real headless mode, and a finite frame count keeps an unattended run
+    // from becoming an accidental infinite process.
     const FLAGS: &[&str] = &[
         "--allow-creates", "--call-terminate-vector", "--completion-list", "--event-buttons",
+        "--headless",
         "--fixed-clock", "--flip-y", "--load-on-open", "--modulate", "--audio", "--mute", "--no-load-on-open",
         "--no-rewind", "--open-returns-handle", "--sync-files", "--wheel-invert", "--wheel-rotate",
     ];
     const VALUE_FLAGS: &[&str] = &[
         "--battery=", "--budget=", "--call-log=", "--callgraph-dump=", "--completion-delay=",
         "--ctx-seed=", "--draws=", "--dump-mem=", "--dump-tex=", "--fast-until=", "--file-ops=",
-        "--flags-addr=", "--fps=", "--frame-reason=", "--gamedir=", "--patch=", "--poke=",
+        "--flags-addr=", "--fps=", "--frames=", "--frame-reason=", "--gamedir=", "--patch=", "--poke=",
         "--press-times=", "--pump-mark=", "--reason-offset=", "--scale=", "--script=",
         "--watch-mem=", "--watch-pc=",
         "--wheel-sensitivity=", "--wheel-top=",
@@ -510,12 +573,12 @@ fn main() {
     // Scripted runs are silent by default; `--audio` overrides for a demo you want to hear.
     let scripted = args.iter().any(|a| a.starts_with("--script="));
     let want_audio = args.iter().any(|a| a == "--audio");
-    if (args.iter().any(|a| a == "--mute") || scripted) && !want_audio {
+    if (args.iter().any(|a| a == "--mute") || scripted || headless) && !want_audio {
         MUTED.store(true, std::sync::atomic::Ordering::Relaxed);
     }
 
     let Some(path) = args.iter().find(|a| !a.starts_with("--")) else {
-        eprintln!("usage: play <game.bin> [--gamedir=DIR] [--scale=N] [--fps=N] [--budget=N]\n         [--async-files] [--wheel-sensitivity=N] [--wheel-invert]");
+        eprintln!("usage: play <game.bin> [--gamedir=DIR] [--scale=N] [--fps=N] [--budget=N]\n         [--headless --frames=N] [--wheel-sensitivity=N] [--wheel-invert]");
         std::process::exit(2);
     };
     let opt = |k: &str, d: usize| -> usize {
@@ -524,6 +587,11 @@ fn main() {
             .and_then(|v| v.parse().ok())
             .unwrap_or(d)
     };
+    let max_frames = opt("--frames=", 0);
+    if headless && max_frames == 0 {
+        eprintln!("--headless requires a positive --frames=N limit");
+        std::process::exit(2);
+    }
 
     let image = fs::read(path).unwrap_or_else(|e| {
         eprintln!("{path}: {e}");
@@ -944,26 +1012,34 @@ fn main() {
 
     println!("title: {title}");
 
-    let mut window = Window::new(
-        &format!("{title} — iPod 5G"),
-        FB_WIDTH,
-        FB_HEIGHT,
-        WindowOptions {
-            scale,
-            // Draggable from any edge, but the panel keeps the iPod's 4:3 shape: the spare space
-            // is let out to the background rather than stretching a 320x240 screen into whatever
-            // rectangle the drag happens to make.
-            resize: true,
-            scale_mode: ScaleMode::AspectRatioStretch,
-            ..WindowOptions::default()
-        },
-    )
-    .unwrap_or_else(|e| {
-        eprintln!("cannot open window: {e}");
-        std::process::exit(1);
-    });
+    let mut window = if headless {
+        println!("headless: running for {max_frames} frame(s)");
+        RunnerWindow::Headless
+    } else {
+        let window = Window::new(
+            &format!("{title} — iPod 5G"),
+            FB_WIDTH,
+            FB_HEIGHT,
+            WindowOptions {
+                scale,
+                // Draggable from any edge, but the panel keeps the iPod's 4:3 shape: the spare space
+                // is let out to the background rather than stretching a 320x240 screen into whatever
+                // rectangle the drag happens to make.
+                resize: true,
+                scale_mode: ScaleMode::AspectRatioStretch,
+                ..WindowOptions::default()
+            },
+        )
+        .unwrap_or_else(|e| {
+            eprintln!("cannot open window: {e}");
+            std::process::exit(1);
+        });
+        RunnerWindow::Interactive(window)
+    };
 
-    lock_aspect_ratio(&window);
+    if let RunnerWindow::Interactive(window) = &window {
+        lock_aspect_ratio(window);
+    }
 
     // `--fps=0` removes the limiter and lets the emulator run as fast as it can. That is safe
     // for the game's own timekeeping because `wall_clock` is on by default: `miscTBD #9` answers
@@ -1330,7 +1406,11 @@ fn main() {
         }
         println!("patched {at:#010x} with {} word(s)", words.len());
     }
-    while window.is_open() && !window.is_key_down(Key::Escape) && !script_quit {
+    while window.is_open()
+        && !window.is_key_down(Key::Escape)
+        && !script_quit
+        && (max_frames == 0 || frames < max_frames)
+    {
         // Retire last frame's buttons FIRST, so a press set below survives into `call_with`.
         // Clearing after the press instead cleared it in the same frame and the game never saw
         // it — which is how W/A/S/D went dead while Select, handled after the clear, still worked.
@@ -2245,7 +2325,7 @@ fn main() {
             // driving, because a scripted run is unattended by definition and this loop is what
             // turned "the title faulted" into "the harness hung until its timeout", with the
             // buffered log thrown away when it was killed.
-            if script.is_empty() {
+            if script.is_empty() && !headless {
                 while window.is_open() && !window.is_key_down(Key::Escape) {
                     let _ = window.update_with_buffer(&buf, FB_WIDTH, FB_HEIGHT);
                     std::thread::sleep(target);
