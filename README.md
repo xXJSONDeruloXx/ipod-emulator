@@ -132,6 +132,22 @@ the window. `ipod-emulator --check-images --flash=… --disk=…` reports on a p
 `tools/ipod-boot/README.md` covers the command-line recipes, and `tools/ipod-film/` records the
 panel to a PNG sequence or an mp4.
 
+### Running a decrypted EAPP game
+
+The PR-3 EAPP runner is available through the `eapp-loader` viewer feature. It opens a game in a
+320x240 window, or it can run the same frame loop without a GUI for a bounded compatibility
+check:
+
+```sh
+cargo run -p eapp-loader --features viewer --bin play -- path/to/Executables/game.bin
+cargo run -p eapp-loader --features viewer --bin play -- path/to/Executables/game.bin \
+  --headless --frames=120 --fixed-clock --fps=0
+```
+
+`--headless` requires `--frames=N` and mutes audio unless `--audio` is explicitly supplied. The
+runner derives the resource directory from the usual `<Game>/Executables/` layout; use
+`--gamedir=DIR` for an alternate bundle.
+
 ### Nothing here is signed with a certificate
 
 Deliberately. Buying one to make a reverse-engineering tool look official is the wrong trade for
