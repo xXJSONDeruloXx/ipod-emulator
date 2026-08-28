@@ -106,7 +106,10 @@ fn collect_bins(dir: &Path, out: &mut Vec<PathBuf>) {
         // Case-insensitively: the game trees came off FAT volumes, where `GAME.BIN` and `Game.bin`
         // are the same name, and on a case-sensitive filesystem the exact comparison silently
         // skipped half of them.
-        } else if p
+        } else if !p
+            .file_name()
+            .is_some_and(|name| name.to_string_lossy().starts_with("._"))
+            && p
             .extension()
             .map(|x| x.to_string_lossy().to_ascii_lowercase())
             .is_some_and(|x| x == "bin" || x == "sinf")
@@ -801,6 +804,20 @@ mod tests {
         let r = inspect(Path::new("x.bin"), b"not an eapp file at all");
         assert!(!r.is_eapp);
         assert!(r.blocks.is_empty());
+    }
+
+    #[test]
+    fn directory_discovery_ignores_appledouble_sidecars() {
+        let dir = std::env::temp_dir().join(format!("eapp-inspect-sidecars-{}", std::process::id()));
+        let _ = fs::create_dir_all(&dir);
+        fs::write(dir.join("game.bin"), b"game").unwrap();
+        fs::write(dir.join("._game.bin"), b"sidecar").unwrap();
+        fs::write(dir.join("._game.bin.sinf"), b"sidecar").unwrap();
+
+        let mut files = Vec::new();
+        collect_bins(&dir, &mut files);
+        assert_eq!(files, vec![dir.join("game.bin")]);
+        let _ = fs::remove_dir_all(&dir);
     }
 }
 

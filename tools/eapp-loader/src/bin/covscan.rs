@@ -247,8 +247,12 @@ fn main() {
     for game in std::fs::read_dir(&root).into_iter().flatten().flatten() {
         let exe = game.path().join("Executables");
         for f in std::fs::read_dir(exe).into_iter().flatten().flatten() {
-            if f.path().extension().is_some_and(|e| e == "bin") {
-                paths.push(f.path());
+            let path = f.path();
+            let sidecar = path
+                .file_name()
+                .is_some_and(|name| name.to_string_lossy().starts_with("._"));
+            if !sidecar && path.extension().is_some_and(|e| e == "bin") {
+                paths.push(path);
             }
         }
     }
